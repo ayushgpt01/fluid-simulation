@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8" />
+    <title>hello-wasm example</title>
+  </head>
+  
+  <body>
+    <canvas id="canvas" width="600" height="400"></canvas>
+
+    <script type="module">
+      import init, { World } from "./pkg/physics_engine.js";
+
+      async function run() {
+        await init();
+
+        const canvas = document.getElementById("canvas");
+        const ctx = canvas.getContext("2d");
+
+        const world = new World();
+
+        let lastTime = performance.now();
+
+        function loop(time) {
+          const dt = (time - lastTime) / 1000;
+          lastTime = time;
+
+          // update physics (WASM)
+          world.update(dt);
+
+          // clear
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+          // draw square
+          ctx.fillRect(world.x(), world.y(), 30, 30);
+
+          requestAnimationFrame(loop);
+        }
+
+        // simple input
+        window.addEventListener("keydown", (e) => {
+          if (e.key === "ArrowUp") {
+            world.apply_force(0, -300);
+          }
+          if (e.key === "ArrowLeft") {
+            world.apply_force(-50, 0);
+          }
+          if (e.key === "ArrowRight") {
+            world.apply_force(50, 0);
+          }
+        });
+
+        requestAnimationFrame(loop);
+      }
+
+      run();
+    </script>
+  </body>
+</html>
