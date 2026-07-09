@@ -1,523 +1,299 @@
-use macroquad::audio::{PlaySoundParams, Sound, load_sound, play_sound, play_sound_once};
-use macroquad::experimental::animation::{AnimatedSprite, Animation};
-use macroquad::experimental::collections::storage;
-use macroquad::experimental::coroutines::start_coroutine;
+use std::f32::consts::PI;
+
 use macroquad::prelude::*;
-use macroquad::ui::{Skin, hash, root_ui};
-use macroquad_particles::{self as particles, AtlasConfig, Emitter, EmitterConfig};
 
-use std::fs;
+// Constants
+const GRAVITY: f32 = 0.0;
+const PIXELS_PER_METER: f32 = 50.0;
+const NUMBER_OF_PARTICLES: usize = 3200;
+const SMOOTHING_RADIUS: f32 = 0.3;
+const MASS: f32 = 1.0;
+const TARGET_DENSITY: f32 = 1.5;
+const PRESSURE_MULTIPLIER: f32 = 16.3;
 
-const FRAGMENT_SHADER: &str = include_str!("starfield-shader.glsl");
+// In pixels
+const PARTICLE_SIZE: f32 = 4.0;
 
-const VERTEX_SHADER: &str = "#version 100
-attribute vec3 position;
-attribute vec2 texcoord;
-attribute vec4 color0;
-varying float iTime;
+// In meters
+const PARTICLE_SPACING: f32 = 0.9;
+const COLLISION_DAMPENING: f32 = 0.6;
 
-uniform mat4 Model;
-uniform mat4 Projection;
-uniform vec4 _Time;
-
-void main() {
-    gl_Position = Projection * Model * vec4(position, 1);
-    iTime = _Time.x;
-}
-";
-
-struct Shape {
-    size: f32,
-    speed: f32,
-    x: f32,
-    y: f32,
-    collided: bool,
+#[derive(Clone, Copy)]
+struct Pair {
+    index: usize,
+    cell_key: usize,
 }
 
-impl Shape {
-    fn collides_with(&self, other: &Self) -> bool {
-        self.rect().overlaps(&other.rect())
-    }
+fn create_grid_particles(positions: &mut Vec<Vec2>, velocities: &mut Vec<Vec2>) {
+    let particles_per_row = (NUMBER_OF_PARTICLES as f32).sqrt();
+    let particles_per_col = ((NUMBER_OF_PARTICLES as f32) - 1.0) / particles_per_row + 1.0;
+    let spacing: f32 = PARTICLE_SPACING;
 
-    fn rect(&self) -> Rect {
-        Rect {
-            x: self.x - self.size / 2.0,
-            y: self.y - self.size / 2.0,
-            w: self.size,
-            h: self.size,
-        }
+    let screen_w_meters = screen_width() / PIXELS_PER_METER;
+    let screen_h_meters = screen_height() / PIXELS_PER_METER;
+    let center_x = screen_w_meters / 2.0;
+    let center_y = screen_h_meters / 2.0;
+
+    for index in 0..NUMBER_OF_PARTICLES {
+        let x: f32 = ((index as f32) % particles_per_row - particles_per_row / 2.0 + 0.5) * spacing;
+        let y: f32 = ((index as f32) / particles_per_row - particles_per_col / 2.0 + 0.5) * spacing;
+        positions.push(vec2(center_x + x, center_y + y));
+        velocities.push(vec2(0.0, 0.0));
     }
 }
 
-enum GameState {
-    MainMenu,
-    Playing,
-    Paused,
-    GameOver,
-}
-
-fn particle_explosion() -> particles::EmitterConfig {
-    particles::EmitterConfig {
-        local_coords: false,
-        one_shot: true,
-        emitting: true,
-        lifetime: 0.6,
-        lifetime_randomness: 0.3,
-        explosiveness: 0.65,
-        initial_direction_spread: 2.0 * std::f32::consts::PI,
-        initial_velocity: 400.0,
-        initial_velocity_randomness: 0.8,
-        size: 16.0,
-        size_randomness: 0.3,
-        atlas: Some(AtlasConfig::new(5, 1, 0..)),
-        ..Default::default()
-    }
-}
-
-struct Resources {
-    ship_texture: Texture2D,
-    bullet_texture: Texture2D,
-    explosion_texture: Texture2D,
-    enemy_small_texture: Texture2D,
-    theme_music: Sound,
-    sound_explosion: Sound,
-    sound_laser: Sound,
-    ui_skin: Skin,
-}
-
-impl Resources {
-    async fn new() -> Result<Resources, macroquad::Error> {
-        let ship_texture: Texture2D = load_texture("ship.png").await?;
-        ship_texture.set_filter(FilterMode::Nearest);
-        let bullet_texture: Texture2D = load_texture("laser-bolts.png").await?;
-        bullet_texture.set_filter(FilterMode::Nearest);
-        let explosion_texture: Texture2D = load_texture("explosion.png").await?;
-        explosion_texture.set_filter(FilterMode::Nearest);
-        let enemy_small_texture: Texture2D = load_texture("enemy-small.png").await?;
-        enemy_small_texture.set_filter(FilterMode::Nearest);
-        build_textures_atlas();
-
-        let theme_music = load_sound("8bit-spaceshooter.ogg").await?;
-        let sound_explosion = load_sound("explosion.wav").await?;
-        let sound_laser = load_sound("laser.wav").await?;
-
-        let window_background = load_image("window_background.png").await?;
-        let button_background = load_image("button_background.png").await?;
-        let button_clicked_background = load_image("button_clicked_background.png").await?;
-        let font = load_file("atari_games.ttf").await?;
-
-        let window_style = root_ui()
-            .style_builder()
-            .background(window_background.clone())
-            .background_margin(RectOffset::new(32.0, 76.0, 44.0, 20.0))
-            .margin(RectOffset::new(0.0, -40.0, 0.0, 0.0))
-            .build();
-        let button_style = root_ui()
-            .style_builder()
-            .background(button_background.clone())
-            .background_clicked(button_clicked_background.clone())
-            .background_margin(RectOffset::new(16.0, 16.0, 16.0, 16.0))
-            .margin(RectOffset::new(16.0, 0.0, -8.0, -8.0))
-            .font(&font)?
-            .text_color(WHITE)
-            .font_size(64)
-            .build();
-        let label_style = root_ui()
-            .style_builder()
-            .font(&font)?
-            .text_color(WHITE)
-            .font_size(28)
-            .build();
-        let ui_skin = Skin {
-            window_style,
-            button_style,
-            label_style,
-            ..root_ui().default_skin()
-        };
-
-        Ok(Resources {
-            ship_texture,
-            bullet_texture,
-            explosion_texture,
-            enemy_small_texture,
-            theme_music,
-            sound_explosion,
-            sound_laser,
-            ui_skin,
-        })
-    }
-
-    pub async fn load() -> Result<(), macroquad::Error> {
-        let resources_loading = start_coroutine(async move {
-            let resources = Resources::new().await.unwrap();
-            storage::store(resources);
-        });
-
-        while !resources_loading.is_done() {
-            clear_background(BLACK);
-            let text = format!(
-                "Loading resources {}",
-                ".".repeat(((get_time() * 2.) as usize) % 4)
-            );
-            draw_text(
-                &text,
-                screen_width() / 2. - 160.,
-                screen_height() / 2.,
-                40.,
-                WHITE,
-            );
-            next_frame().await;
-        }
-
-        Ok(())
-    }
-}
-
-#[macroquad::main("Sandbox")]
+#[macroquad::main("Wave Simulation")]
 async fn main() -> Result<(), macroquad::Error> {
-    const MOVEMENT_SPEED: f32 = 200.0;
+    let mut positions: Vec<Vec2> = vec![];
+    let mut velocities: Vec<Vec2> = vec![];
+    let mut is_paused: bool = true;
 
-    rand::srand(miniquad::date::now() as u64);
-    let mut squares = vec![];
-    let mut bullets: Vec<Shape> = vec![];
-    let mut circle = Shape {
-        size: 32.0,
-        speed: MOVEMENT_SPEED,
-        x: screen_width() / 2.0,
-        y: screen_height() / 2.0,
-        collided: false,
-    };
-    let mut score: u32 = 0;
-    let mut high_score: u32 = fs::read_to_string("highscore.dat")
-        .map_or(Ok(0), |i| i.parse::<u32>())
-        .unwrap_or(0);
-    let mut game_state = GameState::MainMenu;
+    create_grid_particles(&mut positions, &mut velocities);
 
-    let mut direction_modifier: f32 = 0.0;
-    let render_target = render_target(320, 150);
-    render_target.texture.set_filter(FilterMode::Nearest);
-    let material = load_material(
-        ShaderSource::Glsl {
-            vertex: VERTEX_SHADER,
-            fragment: FRAGMENT_SHADER,
-        },
-        MaterialParams {
-            uniforms: vec![
-                UniformDesc::new("iResolution", UniformType::Float2),
-                UniformDesc::new("direction_modifier", UniformType::Float1),
-            ],
-            ..Default::default()
-        },
-    )?;
-
-    let mut explosions: Vec<(Emitter, Vec2)> = vec![];
-
-    set_pc_assets_folder("assets");
-    Resources::load().await?;
-    let resources = storage::get::<Resources>();
-
-    let mut bullet_sprite = AnimatedSprite::new(
-        16,
-        16,
-        &[
-            Animation {
-                name: "bullet".to_string(),
-                row: 0,
-                frames: 2,
-                fps: 12,
-            },
-            Animation {
-                name: "bolt".to_string(),
-                row: 1,
-                frames: 2,
-                fps: 12,
-            },
-        ],
-        true,
-    );
-    bullet_sprite.set_animation(1);
-    let mut ship_sprite = AnimatedSprite::new(
-        16,
-        24,
-        &[
-            Animation {
-                name: "idle".to_string(),
-                row: 0,
-                frames: 2,
-                fps: 12,
-            },
-            Animation {
-                name: "left".to_string(),
-                row: 2,
-                frames: 2,
-                fps: 12,
-            },
-            Animation {
-                name: "right".to_string(),
-                row: 4,
-                frames: 2,
-                fps: 12,
-            },
-        ],
-        true,
-    );
-    let mut enemy_small_sprite = AnimatedSprite::new(
-        17,
-        16,
-        &[Animation {
-            name: "enemy_small".to_string(),
-            row: 0,
-            frames: 2,
-            fps: 12,
-        }],
-        true,
-    );
-
-    play_sound(
-        &resources.theme_music,
-        PlaySoundParams {
-            looped: true,
-            volume: 1.,
-        },
-    );
-
-    root_ui().push_skin(&resources.ui_skin);
-    let window_size = vec2(370.0, 320.0);
+    let mut densities = vec![0.0; NUMBER_OF_PARTICLES];
+    let mut predicted_positions: Vec<Vec2> = vec![vec2(0.0, 0.0); NUMBER_OF_PARTICLES];
+    let mut spatial_lookup = vec![
+        Pair {
+            cell_key: 0,
+            index: 0
+        };
+        NUMBER_OF_PARTICLES
+    ];
+    let mut start_indices = vec![0; NUMBER_OF_PARTICLES];
 
     loop {
         clear_background(BLACK);
+        let delta_time = get_frame_time();
 
-        material.set_uniform("iResolution", (screen_width(), screen_height()));
-        material.set_uniform("direction_modifier", direction_modifier);
-        gl_use_material(&material);
-        draw_texture_ex(
-            &render_target.texture,
-            0.,
-            0.,
-            WHITE,
-            DrawTextureParams {
-                dest_size: Some(vec2(screen_width(), screen_height())),
-                ..Default::default()
-            },
-        );
-        gl_use_default_material();
+        if is_key_pressed(KeyCode::Space) {
+            is_paused = !is_paused;
+        }
 
-        match game_state {
-            GameState::MainMenu => {
-                root_ui().window(
-                    hash!(),
-                    vec2(
-                        screen_width() / 2.0 - window_size.x / 2.0,
-                        screen_height() / 2.0 - window_size.y / 2.0,
-                    ),
-                    window_size,
-                    |ui| {
-                        ui.label(vec2(80.0, -34.0), "Main Menu");
-                        if ui.button(vec2(65.0, 25.0), "Play") {
-                            squares.clear();
-                            bullets.clear();
-                            explosions.clear();
-                            circle.x = screen_width() / 2.0;
-                            circle.y = screen_height() / 2.0;
-                            score = 0;
-                            game_state = GameState::Playing;
-                        }
-                        if ui.button(vec2(65.0, 125.0), "Quit") {
-                            std::process::exit(0);
-                        }
-                    },
-                );
+        if !is_paused {
+            for i in 0..NUMBER_OF_PARTICLES {
+                velocities[i].y += GRAVITY * delta_time;
+                predicted_positions[i] = positions[i] + velocities[i] * delta_time;
             }
-            GameState::Playing => {
-                let delta_time = get_frame_time();
-                ship_sprite.set_animation(0);
-                if is_key_down(KeyCode::Right) {
-                    circle.x += MOVEMENT_SPEED * delta_time;
-                    direction_modifier += 0.05 * delta_time;
-                    ship_sprite.set_animation(2);
-                }
-                if is_key_down(KeyCode::Left) {
-                    circle.x -= MOVEMENT_SPEED * delta_time;
-                    direction_modifier -= 0.05 * delta_time;
-                    ship_sprite.set_animation(1);
-                }
-                if is_key_down(KeyCode::Down) {
-                    circle.y += MOVEMENT_SPEED * delta_time;
-                }
-                if is_key_down(KeyCode::Up) {
-                    circle.y -= MOVEMENT_SPEED * delta_time;
-                }
-                if is_key_pressed(KeyCode::Space) {
-                    bullets.push(Shape {
-                        x: circle.x,
-                        y: circle.y - 24.0,
-                        speed: circle.speed * 2.0,
-                        size: 32.0,
-                        collided: false,
-                    });
-                    play_sound_once(&resources.sound_laser);
-                }
-                if is_key_pressed(KeyCode::Escape) {
-                    game_state = GameState::Paused;
-                }
 
-                // Clamp X and Y to be within the screen
-                circle.x = clamp(circle.x, 0.0, screen_width());
-                circle.y = clamp(circle.y, 0.0, screen_height());
+            update_spatial_lookup(
+                &mut spatial_lookup,
+                &mut start_indices,
+                &predicted_positions,
+                SMOOTHING_RADIUS,
+            );
 
-                // Generate a new square
-                if rand::gen_range(0, 99) >= 95 {
-                    let size = rand::gen_range(16.0, 64.0);
-                    squares.push(Shape {
-                        size,
-                        speed: rand::gen_range(50.0, 150.0),
-                        x: rand::gen_range(size / 2.0, screen_width() - size / 2.0),
-                        y: -size,
-                        collided: false,
-                    });
-                }
-
-                // Movement
-                for square in &mut squares {
-                    square.y += square.speed * delta_time;
-                }
-                for bullet in &mut bullets {
-                    bullet.y -= bullet.speed * delta_time;
-                }
-
-                ship_sprite.update();
-                bullet_sprite.update();
-                enemy_small_sprite.update();
-
-                // Remove shapes outside of screen
-                squares.retain(|square| square.y < screen_height() + square.size);
-                bullets.retain(|bullet| bullet.y > 0.0 - bullet.size / 2.0);
-
-                // Remove collided shapes
-                squares.retain(|square| !square.collided);
-                bullets.retain(|bullet| !bullet.collided);
-
-                // Remove old explosions
-                explosions.retain(|(explosion, _)| explosion.config.emitting);
-
-                // Check for collisions
-                if squares.iter().any(|square| circle.collides_with(square)) {
-                    if score == high_score {
-                        fs::write("highscore.dat", high_score.to_string()).ok();
-                    }
-                    game_state = GameState::GameOver;
-                }
-                for square in squares.iter_mut() {
-                    for bullet in bullets.iter_mut() {
-                        if bullet.collides_with(square) {
-                            bullet.collided = true;
-                            square.collided = true;
-                            score += square.size.round() as u32;
-                            high_score = high_score.max(score);
-                            explosions.push((
-                                Emitter::new(EmitterConfig {
-                                    amount: square.size.round() as u32 * 4,
-                                    texture: Some(resources.explosion_texture.clone()),
-                                    ..particle_explosion()
-                                }),
-                                vec2(square.x, square.y),
-                            ));
-                            play_sound_once(&resources.sound_explosion);
-                        }
-                    }
-                }
-
-                // Draw everything
-                let bullet_frame = bullet_sprite.frame();
-                for bullet in &bullets {
-                    draw_texture_ex(
-                        &resources.bullet_texture,
-                        bullet.x - bullet.size / 2.0,
-                        bullet.y - bullet.size / 2.0,
-                        WHITE,
-                        DrawTextureParams {
-                            dest_size: Some(vec2(bullet.size, bullet.size)),
-                            source: Some(bullet_frame.source_rect),
-                            ..Default::default()
-                        },
-                    );
-                }
-                let ship_frame = ship_sprite.frame();
-                draw_texture_ex(
-                    &resources.ship_texture,
-                    circle.x - ship_frame.dest_size.x,
-                    circle.y - ship_frame.dest_size.y,
-                    WHITE,
-                    DrawTextureParams {
-                        dest_size: Some(ship_frame.dest_size * 2.0),
-                        source: Some(ship_frame.source_rect),
-                        ..Default::default()
-                    },
-                );
-                let enemy_frame = enemy_small_sprite.frame();
-                for square in &squares {
-                    draw_texture_ex(
-                        &resources.enemy_small_texture,
-                        square.x - square.size / 2.0,
-                        square.y - square.size / 2.0,
-                        WHITE,
-                        DrawTextureParams {
-                            dest_size: Some(vec2(square.size, square.size)),
-                            source: Some(enemy_frame.source_rect),
-                            ..Default::default()
-                        },
-                    );
-                }
-                for (explosion, coords) in explosions.iter_mut() {
-                    explosion.draw(*coords);
-                }
-                draw_text(
-                    format!("Score: {}", score).as_str(),
-                    10.0,
-                    35.0,
-                    25.0,
-                    WHITE,
-                );
-                let highscore_text = format!("High score: {}", high_score);
-                let text_dimensions = measure_text(highscore_text.as_str(), None, 25, 1.0);
-                draw_text(
-                    highscore_text.as_str(),
-                    screen_width() - text_dimensions.width - 10.0,
-                    35.0,
-                    25.0,
-                    WHITE,
-                );
+            for i in 0..NUMBER_OF_PARTICLES {
+                densities[i] = calculate_density(i, &predicted_positions);
             }
-            GameState::Paused => {
-                if is_key_pressed(KeyCode::Space) {
-                    game_state = GameState::Playing;
-                }
-                let text = "Paused";
-                let text_dimensions = measure_text(text, None, 50, 1.0);
-                draw_text(
-                    text,
-                    screen_width() / 2.0 - text_dimensions.width / 2.0,
-                    screen_height() / 2.0,
-                    50.0,
-                    WHITE,
+
+            for i in 0..NUMBER_OF_PARTICLES {
+                let pressure_force = calculate_pressure_force(
+                    i,
+                    &predicted_positions,
+                    &densities,
+                    PRESSURE_MULTIPLIER,
                 );
+                let pressure_accelaration = pressure_force / densities[i];
+                velocities[i] += pressure_accelaration * delta_time;
             }
-            GameState::GameOver => {
-                if is_key_pressed(KeyCode::Space) {
-                    game_state = GameState::MainMenu;
-                }
-                let text = "GAME OVER!";
-                let text_dimensions = measure_text(text, None, 50, 1.0);
-                draw_text(
-                    text,
-                    screen_width() / 2.0 - text_dimensions.width / 2.0,
-                    screen_height() / 2.0,
-                    50.0,
-                    RED,
-                );
+        }
+
+        for i in 0..NUMBER_OF_PARTICLES {
+            if !is_paused {
+                positions[i] += velocities[i] * delta_time;
+
+                resolve_collisions(&mut positions[i], &mut velocities[i]);
             }
+
+            let render_x = positions[i].x * PIXELS_PER_METER;
+            let render_y = positions[i].y * PIXELS_PER_METER;
+
+            draw_poly(render_x, render_y, 255, PARTICLE_SIZE, 0., SKYBLUE);
         }
 
         next_frame().await
     }
 }
+
+fn resolve_collisions(position: &mut Vec2, velocity: &mut Vec2) {
+    let screen_w_meters = screen_width() / PIXELS_PER_METER;
+    let screen_h_meters = screen_height() / PIXELS_PER_METER;
+    let radius_meters = PARTICLE_SIZE / PIXELS_PER_METER;
+
+    if position.x < radius_meters || position.x.abs() > screen_w_meters - radius_meters {
+        position.x = clamp(position.x, radius_meters, screen_w_meters - radius_meters);
+        velocity.x *= -1.0 * COLLISION_DAMPENING;
+    }
+
+    if position.y < radius_meters || position.y.abs() > screen_h_meters - radius_meters {
+        position.y = clamp(position.y, radius_meters, screen_h_meters - radius_meters);
+        velocity.y *= -1.0 * COLLISION_DAMPENING;
+    }
+}
+
+// W(r,h) -> h is core radius
+fn smoothing_kernel(radius: f32, distance: f32) -> f32 {
+    if distance >= radius {
+        return 0.0;
+    }
+
+    let volume = (PI * radius.powf(4.0)) / 6.0;
+    (radius - distance) * (radius - distance) / volume
+}
+
+fn smoothing_kernel_derivative(radius: f32, distance: f32) -> f32 {
+    if distance >= radius || distance == 0.0 {
+        return 0.0;
+    }
+
+    let scale = 12.0 / (PI * radius.powf(4.0));
+    (distance - radius) * scale
+}
+
+fn convert_density_to_pressure(density: f32, pressure_multiplier: f32) -> f32 {
+    let density_error = density - TARGET_DENSITY;
+    density_error * pressure_multiplier
+}
+
+fn calculate_shared_pressure(d1: f32, d2: f32, pressure_multiplier: f32) -> f32 {
+    (convert_density_to_pressure(d1, pressure_multiplier)
+        + convert_density_to_pressure(d2, pressure_multiplier))
+        / 2.0
+}
+
+fn calculate_pressure_force(
+    particle_index: usize,
+    positions: &Vec<Vec2>,
+    densities: &Vec<f32>,
+    pressure_multiplier: f32,
+) -> Vec2 {
+    let mut pressure_force = vec2(0.0, 0.0);
+
+    for i in 0..NUMBER_OF_PARTICLES {
+        if particle_index == i {
+            continue;
+        }
+        let offset = positions[i] - positions[particle_index];
+        let dist = offset.length();
+        let dir = if dist == 0.0 {
+            vec2(rand::gen_range(-1.0, 1.0), rand::gen_range(-1.0, 1.0)).normalize_or_zero()
+        } else {
+            offset / dist
+        };
+        let slope = smoothing_kernel_derivative(SMOOTHING_RADIUS, dist);
+        let density = densities[i];
+        let shared_pressure =
+            calculate_shared_pressure(density, densities[particle_index], pressure_multiplier);
+        pressure_force += shared_pressure * dir * slope * MASS / density;
+    }
+
+    pressure_force
+}
+
+fn calculate_density(position_index: usize, positions: &Vec<Vec2>) -> f32 {
+    let mut density: f32 = 0.0;
+
+    for position in positions {
+        let distance = (*position - positions[position_index]).length();
+        let influence = smoothing_kernel(SMOOTHING_RADIUS, distance);
+        density += MASS * influence;
+    }
+
+    density
+}
+
+fn position_to_cell_coord(point: &Vec2, radius: f32) -> (i32, i32) {
+    let cell_x = (point.x / radius) as i32;
+    let cell_y = (point.y / radius) as i32;
+    (cell_x, cell_y)
+}
+
+fn hash_cell(cell_x: i32, cell_y: i32) -> usize {
+    let x = cell_x as usize;
+    let y = cell_y as usize;
+
+    x.wrapping_mul(15823).wrapping_add(y.wrapping_mul(9737333))
+}
+
+fn get_key_from_hash(hash: usize, len: usize) -> usize {
+    hash % len
+}
+
+fn update_spatial_lookup(
+    spatial_lookup: &mut Vec<Pair>,
+    start_indices: &mut Vec<usize>,
+    positions: &Vec<Vec2>,
+    radius: f32,
+) {
+    for i in 0..positions.len() {
+        let (cell_x, cell_y) = position_to_cell_coord(&positions[i], radius);
+        let cell_key = get_key_from_hash(hash_cell(cell_x, cell_y), spatial_lookup.len());
+        spatial_lookup[i] = Pair { index: i, cell_key };
+        start_indices[i] = usize::MAX;
+    }
+
+    spatial_lookup.sort_by_key(|p| p.cell_key);
+
+    for i in 0..positions.len() {
+        let key = spatial_lookup[i].cell_key;
+        let key_prev = if i == 0 {
+            usize::MAX
+        } else {
+            spatial_lookup[i - 1].cell_key
+        };
+
+        if key != key_prev {
+            start_indices[key] = i;
+        }
+    }
+}
+
+const CELL_OFFSETS: [(i32, i32); 9] = [
+    (-1, -1),
+    (0, -1),
+    (1, -1),
+    (-1, 0),
+    (0, 0),
+    (1, 0),
+    (-1, 1),
+    (0, 1),
+    (1, 1),
+];
+
+fn look_within_radius(
+    point: &Vec2,
+    spatial_lookup: &Vec<Pair>,
+    start_indices: &Vec<usize>,
+    positions: &Vec<Vec2>,
+) -> impl Iterator<Item = usize> {
+    let (center_x, center_y) = position_to_cell_coord(point, SMOOTHING_RADIUS);
+    let sqr_radius = SMOOTHING_RADIUS * SMOOTHING_RADIUS;
+
+    CELL_OFFSETS.iter().flat_map(move |&(offset_x, offset_y)| {
+        let key = get_key_from_hash(
+            hash_cell(center_x + offset_x, center_y + offset_y),
+            spatial_lookup.len(),
+        );
+        let cell_start_index = start_indices[key];
+
+        // if cell_start_index == usize::MAX {
+        //     return [].as_slice().iter().copied().flat_map(|_| None);
+        // }
+
+        spatial_lookup[cell_start_index..]
+            .iter()
+            .take_while(move |pair| pair.cell_key == key)
+            .filter_map(move |pair| {
+                let particle_index = pair.index;
+                let sqr_dist = (positions[particle_index] - *point).length_squared();
+                if sqr_dist <= sqr_radius {
+                    Some(particle_index)
+                } else {
+                    None
+                }
+            })
+    })
+}
+
+// Optimising Lookups - https://youtu.be/rSKMYc1CQHE?si=lIqsg9nogyTjc1um&t=1351
+// first commit link - https://github.com/SebLague/Fluid-Sim/commit/f9dd346947b399de521390bdb2c5d4514c0c18c6#diff-125c6cd84a4d34af9e518d4f6c5b0e5161be9a9800e0e300575bb2a7f7826026
