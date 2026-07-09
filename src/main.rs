@@ -1,22 +1,25 @@
 use std::f32::consts::PI;
 
 use macroquad::prelude::*;
+use rayon::prelude::*;
 
 // Constants
 const GRAVITY: f32 = 0.0;
 const PIXELS_PER_METER: f32 = 50.0;
-const NUMBER_OF_PARTICLES: usize = 3200;
-const SMOOTHING_RADIUS: f32 = 0.3;
+const NUMBER_OF_PARTICLES: usize = 1500;
+const SMOOTHING_RADIUS: f32 = 0.35;
 const MASS: f32 = 1.0;
-const TARGET_DENSITY: f32 = 1.5;
-const PRESSURE_MULTIPLIER: f32 = 16.3;
+const TARGET_DENSITY: f32 = 5.2;
+const PRESSURE_MULTIPLIER: f32 = 15.8;
+const MAX_SPEED: f32 = 14.0;
+const VISCOSITY_STRENGTH: f32 = 2.5;
 
 // In pixels
 const PARTICLE_SIZE: f32 = 4.0;
 
 // In meters
 const PARTICLE_SPACING: f32 = 0.9;
-const COLLISION_DAMPENING: f32 = 0.6;
+const COLLISION_DAMPENING: f32 = 0.95;
 
 #[derive(Clone, Copy)]
 struct Pair {
@@ -24,13 +27,20 @@ struct Pair {
     cell_key: usize,
 }
 
+fn get_screen_width() -> f32 {
+    600.0
+}
+fn get_screen_height() -> f32 {
+    600.0
+}
+
 fn create_grid_particles(positions: &mut Vec<Vec2>, velocities: &mut Vec<Vec2>) {
     let particles_per_row = (NUMBER_OF_PARTICLES as f32).sqrt();
     let particles_per_col = ((NUMBER_OF_PARTICLES as f32) - 1.0) / particles_per_row + 1.0;
     let spacing: f32 = PARTICLE_SPACING;
 
-    let screen_w_meters = screen_width() / PIXELS_PER_METER;
-    let screen_h_meters = screen_height() / PIXELS_PER_METER;
+    let screen_w_meters = get_screen_width() / PIXELS_PER_METER;
+    let screen_h_meters = get_screen_height() / PIXELS_PER_METER;
     let center_x = screen_w_meters / 2.0;
     let center_y = screen_h_meters / 2.0;
 
@@ -42,7 +52,26 @@ fn create_grid_particles(positions: &mut Vec<Vec2>, velocities: &mut Vec<Vec2>) 
     }
 }
 
-#[macroquad::main("Wave Simulation")]
+fn lerp_color(a: Color, b: Color, t: f32) -> Color {
+    Color::new(
+        a.r + (b.r - a.r) * t,
+        a.g + (b.g - a.g) * t,
+        a.b + (b.b - a.b) * t,
+        a.a + (b.a - a.a) * t,
+    )
+}
+
+fn window_conf() -> Conf {
+    Conf {
+        window_title: "Wave Simulation".to_owned(),
+        window_width: get_screen_width() as i32,
+        window_height: get_screen_height() as i32,
+        window_resizable: false,
+        ..Default::default()
+    }
+}
+
+#[macroquad::main(window_conf)]
 async fn main() -> Result<(), macroquad::Error> {
     let mut positions: Vec<Vec2> = vec![];
     let mut velocities: Vec<Vec2> = vec![];
@@ -70,10 +99,14 @@ async fn main() -> Result<(), macroquad::Error> {
         }
 
         if !is_paused {
-            for i in 0..NUMBER_OF_PARTICLES {
-                velocities[i].y += GRAVITY * delta_time;
-                predicted_positions[i] = positions[i] + velocities[i] * delta_time;
-            }
+            velocities
+                .par_iter_mut()
+                .zip(&mut predicted_positions)
+                .zip(&positions)
+                .for_each(|((velocity, predicted_pos), position)| {
+                    velocity.y += GRAVITY * delta_time;
+                    *predicted_pos = *position + *velocity * 1.0 / 120.0;
+                });
 
             update_spatial_lookup(
                 &mut spatial_lookup,
@@ -82,33 +115,59 @@ async fn main() -> Result<(), macroquad::Error> {
                 SMOOTHING_RADIUS,
             );
 
-            for i in 0..NUMBER_OF_PARTICLES {
-                densities[i] = calculate_density(i, &predicted_positions);
-            }
+            densities
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(i, density)| {
+                    *density =
+                        calculate_density(i, &predicted_positions, &spatial_lookup, &start_indices);
+                });
 
-            for i in 0..NUMBER_OF_PARTICLES {
-                let pressure_force = calculate_pressure_force(
-                    i,
-                    &predicted_positions,
-                    &densities,
-                    PRESSURE_MULTIPLIER,
-                );
-                let pressure_accelaration = pressure_force / densities[i];
-                velocities[i] += pressure_accelaration * delta_time;
-            }
+            let velocities_snapshot = velocities.clone();
+
+            velocities
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(i, velocity)| {
+                    let pressure_force = calculate_pressure_force(
+                        i,
+                        &predicted_positions,
+                        &densities,
+                        PRESSURE_MULTIPLIER,
+                        &spatial_lookup,
+                        &start_indices,
+                    );
+                    let viscosity_force = calculate_viscosity_force(
+                        i,
+                        &predicted_positions,
+                        &velocities_snapshot,
+                        &spatial_lookup,
+                        &start_indices,
+                    );
+
+                    let total_force = pressure_force + viscosity_force;
+                    let acceleration = total_force / densities[i];
+                    *velocity += acceleration * delta_time;
+                });
+
+            positions
+                .par_iter_mut()
+                .zip(&mut velocities)
+                .for_each(|(position, velocity)| {
+                    *position += *velocity * delta_time;
+
+                    resolve_collisions(position, velocity);
+                });
         }
 
         for i in 0..NUMBER_OF_PARTICLES {
-            if !is_paused {
-                positions[i] += velocities[i] * delta_time;
-
-                resolve_collisions(&mut positions[i], &mut velocities[i]);
-            }
-
             let render_x = positions[i].x * PIXELS_PER_METER;
             let render_y = positions[i].y * PIXELS_PER_METER;
+            let speed = velocities[i].length();
+            let normalized_speed = (speed / MAX_SPEED).clamp(0.0, 1.0);
 
-            draw_poly(render_x, render_y, 255, PARTICLE_SIZE, 0., SKYBLUE);
+            let current_color = lerp_color(BLUE, RED, normalized_speed);
+            draw_poly(render_x, render_y, 255, PARTICLE_SIZE, 0., current_color);
         }
 
         next_frame().await
@@ -116,8 +175,8 @@ async fn main() -> Result<(), macroquad::Error> {
 }
 
 fn resolve_collisions(position: &mut Vec2, velocity: &mut Vec2) {
-    let screen_w_meters = screen_width() / PIXELS_PER_METER;
-    let screen_h_meters = screen_height() / PIXELS_PER_METER;
+    let screen_w_meters = get_screen_width() / PIXELS_PER_METER;
+    let screen_h_meters = get_screen_height() / PIXELS_PER_METER;
     let radius_meters = PARTICLE_SIZE / PIXELS_PER_METER;
 
     if position.x < radius_meters || position.x.abs() > screen_w_meters - radius_meters {
@@ -166,22 +225,26 @@ fn calculate_pressure_force(
     positions: &Vec<Vec2>,
     densities: &Vec<f32>,
     pressure_multiplier: f32,
+    spatial_lookup: &Vec<Pair>,
+    start_indices: &Vec<usize>,
 ) -> Vec2 {
     let mut pressure_force = vec2(0.0, 0.0);
+    let pos = positions[particle_index];
 
-    for i in 0..NUMBER_OF_PARTICLES {
-        if particle_index == i {
+    for index in look_within_radius(&pos, spatial_lookup, start_indices, positions) {
+        if particle_index == index {
             continue;
         }
-        let offset = positions[i] - positions[particle_index];
+        let offset = positions[index] - pos;
         let dist = offset.length();
         let dir = if dist == 0.0 {
-            vec2(rand::gen_range(-1.0, 1.0), rand::gen_range(-1.0, 1.0)).normalize_or_zero()
+            let angle = (index as f32) * 0.1;
+            vec2(angle.cos(), angle.sin())
         } else {
             offset / dist
         };
         let slope = smoothing_kernel_derivative(SMOOTHING_RADIUS, dist);
-        let density = densities[i];
+        let density = densities[index];
         let shared_pressure =
             calculate_shared_pressure(density, densities[particle_index], pressure_multiplier);
         pressure_force += shared_pressure * dir * slope * MASS / density;
@@ -190,11 +253,17 @@ fn calculate_pressure_force(
     pressure_force
 }
 
-fn calculate_density(position_index: usize, positions: &Vec<Vec2>) -> f32 {
+fn calculate_density(
+    position_index: usize,
+    positions: &Vec<Vec2>,
+    spatial_lookup: &Vec<Pair>,
+    start_indices: &Vec<usize>,
+) -> f32 {
     let mut density: f32 = 0.0;
+    let pos = positions[position_index];
 
-    for position in positions {
-        let distance = (*position - positions[position_index]).length();
+    for index in look_within_radius(&pos, spatial_lookup, start_indices, positions) {
+        let distance = (positions[index] - pos).length();
         let influence = smoothing_kernel(SMOOTHING_RADIUS, distance);
         density += MASS * influence;
     }
@@ -248,6 +317,36 @@ fn update_spatial_lookup(
     }
 }
 
+fn viscosity_smoothing_kernel(distance: f32, radius: f32) -> f32 {
+    let volume = PI * radius.powf(8.0) / 4.0;
+    let dist = radius * radius - distance * distance;
+    let value = dist.max(0.0);
+    value * value * value / volume
+}
+
+fn calculate_viscosity_force(
+    particle_index: usize,
+    positions: &Vec<Vec2>,
+    velocities: &Vec<Vec2>,
+    spatial_lookup: &Vec<Pair>,
+    start_indices: &Vec<usize>,
+) -> Vec2 {
+    let mut force = vec2(0.0, 0.0);
+    let pos = positions[particle_index];
+
+    for index in look_within_radius(&pos, spatial_lookup, start_indices, positions) {
+        if particle_index == index {
+            continue;
+        }
+
+        let dist = (pos - positions[index]).length();
+        let influence = viscosity_smoothing_kernel(dist, SMOOTHING_RADIUS);
+        force += (velocities[index] - velocities[particle_index]) * influence;
+    }
+
+    force * VISCOSITY_STRENGTH
+}
+
 const CELL_OFFSETS: [(i32, i32); 9] = [
     (-1, -1),
     (0, -1),
@@ -276,11 +375,13 @@ fn look_within_radius(
         );
         let cell_start_index = start_indices[key];
 
-        // if cell_start_index == usize::MAX {
-        //     return [].as_slice().iter().copied().flat_map(|_| None);
-        // }
+        let slice = if cell_start_index == usize::MAX {
+            &spatial_lookup[0..0]
+        } else {
+            &spatial_lookup[cell_start_index..]
+        };
 
-        spatial_lookup[cell_start_index..]
+        slice
             .iter()
             .take_while(move |pair| pair.cell_key == key)
             .filter_map(move |pair| {
