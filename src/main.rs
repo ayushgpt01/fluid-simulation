@@ -1,25 +1,20 @@
 use std::f32::consts::PI;
 
 use macroquad::prelude::*;
+use macroquad::ui::{hash, root_ui, widgets};
 use rayon::prelude::*;
 
 // Constants
-const GRAVITY: f32 = 0.0;
-const PIXELS_PER_METER: f32 = 50.0;
-const NUMBER_OF_PARTICLES: usize = 1500;
-const SMOOTHING_RADIUS: f32 = 0.35;
-const MASS: f32 = 1.0;
-const TARGET_DENSITY: f32 = 5.2;
-const PRESSURE_MULTIPLIER: f32 = 15.8;
 const MAX_SPEED: f32 = 14.0;
-const VISCOSITY_STRENGTH: f32 = 2.5;
+const MASS: f32 = 1.0;
+const PIXELS_PER_METER: f32 = 50.0;
+const NUMBER_OF_PARTICLES: usize = 1200;
 
 // In pixels
 const PARTICLE_SIZE: f32 = 4.0;
 
 // In meters
 const PARTICLE_SPACING: f32 = 0.9;
-const COLLISION_DAMPENING: f32 = 0.95;
 
 #[derive(Clone, Copy)]
 struct Pair {
@@ -73,6 +68,13 @@ fn window_conf() -> Conf {
 
 #[macroquad::main(window_conf)]
 async fn main() -> Result<(), macroquad::Error> {
+    let mut gravity: f32 = 9.8;
+    let mut smoothing_radius: f32 = 0.35;
+    let mut target_density: f32 = 20.0;
+    let mut pressure_multiplier: f32 = 15.68;
+    let mut viscosity_strength: f32 = 0.75;
+    let mut collision_dampening: f32 = 0.95;
+
     let mut positions: Vec<Vec2> = vec![];
     let mut velocities: Vec<Vec2> = vec![];
     let mut is_paused: bool = true;
@@ -104,23 +106,28 @@ async fn main() -> Result<(), macroquad::Error> {
                 .zip(&mut predicted_positions)
                 .zip(&positions)
                 .for_each(|((velocity, predicted_pos), position)| {
-                    velocity.y += GRAVITY * delta_time;
-                    *predicted_pos = *position + *velocity * 1.0 / 120.0;
+                    velocity.y += gravity * delta_time;
+                    *predicted_pos = *position + *velocity * delta_time;
                 });
 
             update_spatial_lookup(
                 &mut spatial_lookup,
                 &mut start_indices,
                 &predicted_positions,
-                SMOOTHING_RADIUS,
+                smoothing_radius,
             );
 
             densities
                 .par_iter_mut()
                 .enumerate()
                 .for_each(|(i, density)| {
-                    *density =
-                        calculate_density(i, &predicted_positions, &spatial_lookup, &start_indices);
+                    *density = calculate_density(
+                        i,
+                        &predicted_positions,
+                        &spatial_lookup,
+                        &start_indices,
+                        smoothing_radius,
+                    );
                 });
 
             let velocities_snapshot = velocities.clone();
@@ -133,9 +140,11 @@ async fn main() -> Result<(), macroquad::Error> {
                         i,
                         &predicted_positions,
                         &densities,
-                        PRESSURE_MULTIPLIER,
+                        pressure_multiplier,
                         &spatial_lookup,
                         &start_indices,
+                        target_density,
+                        smoothing_radius,
                     );
                     let viscosity_force = calculate_viscosity_force(
                         i,
@@ -143,6 +152,8 @@ async fn main() -> Result<(), macroquad::Error> {
                         &velocities_snapshot,
                         &spatial_lookup,
                         &start_indices,
+                        smoothing_radius,
+                        viscosity_strength,
                     );
 
                     let total_force = pressure_force + viscosity_force;
@@ -156,7 +167,7 @@ async fn main() -> Result<(), macroquad::Error> {
                 .for_each(|(position, velocity)| {
                     *position += *velocity * delta_time;
 
-                    resolve_collisions(position, velocity);
+                    resolve_collisions(position, velocity, collision_dampening);
                 });
         }
 
@@ -170,23 +181,79 @@ async fn main() -> Result<(), macroquad::Error> {
             draw_poly(render_x, render_y, 255, PARTICLE_SIZE, 0., current_color);
         }
 
+        widgets::Window::new(hash!(), vec2(20.0, 20.0), vec2(250.0, 180.0))
+            .label("Simulation Settings")
+            .ui(&mut *root_ui(), |ui| {
+                // Show status and a simple button to toggle pause
+                let btn_label = if is_paused {
+                    "Resume Simulation"
+                } else {
+                    "Pause Simulation"
+                };
+                if ui.button(None, btn_label) {
+                    is_paused = !is_paused;
+                }
+
+                ui.separator();
+
+                // Sliders to dynamically adjust values at runtime
+                ui.slider(hash!("gravity"), "Gravity", -20.0..20.0, &mut gravity);
+                // let mut smoothing_radius: f32 = 0.35;
+                ui.slider(
+                    hash!("smoothing_radius"),
+                    "Smoothing Radius",
+                    0.05..1.0,
+                    &mut smoothing_radius,
+                );
+                // let mut target_density: f32 = 5.2;
+                ui.slider(
+                    hash!("target_density"),
+                    "Target Density",
+                    0.5..5.0,
+                    &mut target_density,
+                );
+                // let mut pressure_multiplier: f32 = 15.8;
+                ui.slider(
+                    hash!("pressure_multiplier"),
+                    "Pressure Multiplier",
+                    1.0..100.0,
+                    &mut pressure_multiplier,
+                );
+                // let mut viscosity_strength: f32 = 2.5;
+                ui.slider(
+                    hash!("viscosity_strength"),
+                    "Viscosity Strength",
+                    0.0..2.0,
+                    &mut viscosity_strength,
+                );
+                // let mut collision_dampening: f32 = 0.95;
+                ui.slider(
+                    hash!("collision_dampening"),
+                    "Collision Dampening",
+                    0.0..1.0,
+                    &mut collision_dampening,
+                );
+            });
+
+        draw_fps();
+
         next_frame().await
     }
 }
 
-fn resolve_collisions(position: &mut Vec2, velocity: &mut Vec2) {
+fn resolve_collisions(position: &mut Vec2, velocity: &mut Vec2, collision_dampening: f32) {
     let screen_w_meters = get_screen_width() / PIXELS_PER_METER;
     let screen_h_meters = get_screen_height() / PIXELS_PER_METER;
     let radius_meters = PARTICLE_SIZE / PIXELS_PER_METER;
 
     if position.x < radius_meters || position.x.abs() > screen_w_meters - radius_meters {
         position.x = clamp(position.x, radius_meters, screen_w_meters - radius_meters);
-        velocity.x *= -1.0 * COLLISION_DAMPENING;
+        velocity.x *= -1.0 * collision_dampening;
     }
 
     if position.y < radius_meters || position.y.abs() > screen_h_meters - radius_meters {
         position.y = clamp(position.y, radius_meters, screen_h_meters - radius_meters);
-        velocity.y *= -1.0 * COLLISION_DAMPENING;
+        velocity.y *= -1.0 * collision_dampening;
     }
 }
 
@@ -209,14 +276,19 @@ fn smoothing_kernel_derivative(radius: f32, distance: f32) -> f32 {
     (distance - radius) * scale
 }
 
-fn convert_density_to_pressure(density: f32, pressure_multiplier: f32) -> f32 {
-    let density_error = density - TARGET_DENSITY;
+fn convert_density_to_pressure(density: f32, pressure_multiplier: f32, target_density: f32) -> f32 {
+    let density_error = density - target_density;
     density_error * pressure_multiplier
 }
 
-fn calculate_shared_pressure(d1: f32, d2: f32, pressure_multiplier: f32) -> f32 {
-    (convert_density_to_pressure(d1, pressure_multiplier)
-        + convert_density_to_pressure(d2, pressure_multiplier))
+fn calculate_shared_pressure(
+    d1: f32,
+    d2: f32,
+    pressure_multiplier: f32,
+    target_density: f32,
+) -> f32 {
+    (convert_density_to_pressure(d1, pressure_multiplier, target_density)
+        + convert_density_to_pressure(d2, pressure_multiplier, target_density))
         / 2.0
 }
 
@@ -227,11 +299,19 @@ fn calculate_pressure_force(
     pressure_multiplier: f32,
     spatial_lookup: &Vec<Pair>,
     start_indices: &Vec<usize>,
+    target_density: f32,
+    smoothing_radius: f32,
 ) -> Vec2 {
     let mut pressure_force = vec2(0.0, 0.0);
     let pos = positions[particle_index];
 
-    for index in look_within_radius(&pos, spatial_lookup, start_indices, positions) {
+    for index in look_within_radius(
+        &pos,
+        spatial_lookup,
+        start_indices,
+        positions,
+        smoothing_radius,
+    ) {
         if particle_index == index {
             continue;
         }
@@ -243,10 +323,14 @@ fn calculate_pressure_force(
         } else {
             offset / dist
         };
-        let slope = smoothing_kernel_derivative(SMOOTHING_RADIUS, dist);
+        let slope = smoothing_kernel_derivative(smoothing_radius, dist);
         let density = densities[index];
-        let shared_pressure =
-            calculate_shared_pressure(density, densities[particle_index], pressure_multiplier);
+        let shared_pressure = calculate_shared_pressure(
+            density,
+            densities[particle_index],
+            pressure_multiplier,
+            target_density,
+        );
         pressure_force += shared_pressure * dir * slope * MASS / density;
     }
 
@@ -258,13 +342,20 @@ fn calculate_density(
     positions: &Vec<Vec2>,
     spatial_lookup: &Vec<Pair>,
     start_indices: &Vec<usize>,
+    smoothing_radius: f32,
 ) -> f32 {
     let mut density: f32 = 0.0;
     let pos = positions[position_index];
 
-    for index in look_within_radius(&pos, spatial_lookup, start_indices, positions) {
+    for index in look_within_radius(
+        &pos,
+        spatial_lookup,
+        start_indices,
+        positions,
+        smoothing_radius,
+    ) {
         let distance = (positions[index] - pos).length();
-        let influence = smoothing_kernel(SMOOTHING_RADIUS, distance);
+        let influence = smoothing_kernel(smoothing_radius, distance);
         density += MASS * influence;
     }
 
@@ -330,21 +421,29 @@ fn calculate_viscosity_force(
     velocities: &Vec<Vec2>,
     spatial_lookup: &Vec<Pair>,
     start_indices: &Vec<usize>,
+    smoothing_radius: f32,
+    viscosity_strength: f32,
 ) -> Vec2 {
     let mut force = vec2(0.0, 0.0);
     let pos = positions[particle_index];
 
-    for index in look_within_radius(&pos, spatial_lookup, start_indices, positions) {
+    for index in look_within_radius(
+        &pos,
+        spatial_lookup,
+        start_indices,
+        positions,
+        smoothing_radius,
+    ) {
         if particle_index == index {
             continue;
         }
 
         let dist = (pos - positions[index]).length();
-        let influence = viscosity_smoothing_kernel(dist, SMOOTHING_RADIUS);
+        let influence = viscosity_smoothing_kernel(dist, smoothing_radius);
         force += (velocities[index] - velocities[particle_index]) * influence;
     }
 
-    force * VISCOSITY_STRENGTH
+    force * viscosity_strength
 }
 
 const CELL_OFFSETS: [(i32, i32); 9] = [
@@ -364,15 +463,16 @@ fn look_within_radius(
     spatial_lookup: &Vec<Pair>,
     start_indices: &Vec<usize>,
     positions: &Vec<Vec2>,
+    smoothing_radius: f32,
 ) -> impl Iterator<Item = usize> {
-    let (center_x, center_y) = position_to_cell_coord(point, SMOOTHING_RADIUS);
-    let sqr_radius = SMOOTHING_RADIUS * SMOOTHING_RADIUS;
+    let (center_x, center_y) = position_to_cell_coord(point, smoothing_radius);
+    let sqr_radius = smoothing_radius * smoothing_radius;
 
     CELL_OFFSETS.iter().flat_map(move |&(offset_x, offset_y)| {
-        let key = get_key_from_hash(
-            hash_cell(center_x + offset_x, center_y + offset_y),
-            spatial_lookup.len(),
-        );
+        let cell_x = center_x.wrapping_add(offset_x);
+        let cell_y = center_y.wrapping_add(offset_y);
+
+        let key = get_key_from_hash(hash_cell(cell_x, cell_y), spatial_lookup.len());
         let cell_start_index = start_indices[key];
 
         let slice = if cell_start_index == usize::MAX {
