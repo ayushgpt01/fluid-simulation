@@ -1,6 +1,6 @@
-use bevy::prelude::*;
+use bevy::{prelude::*, render::extract_resource::ExtractResource};
 
-#[derive(Resource, Default)]
+#[derive(Resource, Default, Clone, ExtractResource)]
 pub struct FluidBuffer {
     pub velocities: Vec<Vec2>,
     pub positions: Vec<Vec2>,

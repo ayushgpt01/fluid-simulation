@@ -55,7 +55,7 @@ fn main() -> AppExit {
     app.run()
 }
 
-#[derive(States, Default, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(States, Default, Debug, Clone, Copy, PartialEq, Eq, Hash, Reflect)]
 pub enum SimulationState {
     #[default]
     Idle,
@@ -63,12 +63,19 @@ pub enum SimulationState {
     Paused,
 }
 
+#[derive(Default, States, Clone, Copy, PartialEq, Eq, Hash, Debug, Reflect)]
+pub enum PhysicsBackend {
+    #[default]
+    CPU,
+    GPU,
+}
+
 struct AppPlugin;
 
 impl Plugin for AppPlugin {
     fn build(&self, app: &mut App) {
         let fluid_settings = FluidSettings::new();
-        let fluid_buffer = FluidBuffer::new(fluid_settings.number_of_particles);
+        let fluid_buffer = FluidBuffer::new(fluid_settings.number_of_particles as usize);
 
         app.insert_resource(ClearColor(Color::BLACK))
             .insert_resource(fluid_settings)
@@ -80,6 +87,10 @@ impl Plugin for AppPlugin {
             .add_systems(
                 Update,
                 handle_pause.run_if(input_just_pressed(KeyCode::Space)),
+            )
+            .add_systems(
+                Update,
+                handle_change_backend.run_if(input_just_pressed(KeyCode::KeyG)),
             );
     }
 }
@@ -94,6 +105,20 @@ fn handle_pause(
         }
         SimulationState::Running => {
             next_state.set(SimulationState::Paused);
+        }
+    }
+}
+
+fn handle_change_backend(
+    state: Res<State<PhysicsBackend>>,
+    mut next_state: ResMut<NextState<PhysicsBackend>>,
+) {
+    match state.get() {
+        PhysicsBackend::CPU => {
+            next_state.set(PhysicsBackend::GPU);
+        }
+        PhysicsBackend::GPU => {
+            next_state.set(PhysicsBackend::CPU);
         }
     }
 }

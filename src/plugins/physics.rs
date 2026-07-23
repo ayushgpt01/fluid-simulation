@@ -2,10 +2,10 @@ use bevy::prelude::*;
 use rayon::prelude::*;
 
 use crate::{
-    SimulationState,
+    PhysicsBackend, SimulationState,
     plugins::{
-        CELL_OFFSETS, density_derivative, density_kernel, get_cell, hash_cell, key_from_hash,
-        near_density_derivative, near_density_kernel, near_pressure_from_density,
+        CELL_OFFSETS, PhysicsGPUPlugin, density_derivative, density_kernel, get_cell, hash_cell,
+        key_from_hash, near_density_derivative, near_density_kernel, near_pressure_from_density,
         pressure_from_density, spawner::SpawnerSettings, viscosity_kernel,
     },
     resources::{FluidBuffer, FluidSettings, GradientLookup},
@@ -15,21 +15,24 @@ pub struct Physics;
 
 impl Plugin for Physics {
     fn build(&self, app: &mut App) {
-        app.add_systems(
-            FixedUpdate,
-            (
-                external_forces,
-                run_spatial_hash,
-                update_density,
-                apply_pressure,
-                apply_viscosity,
-                update_positions,
-                resolve_collisions,
-                compute_particle_colors,
+        app.init_state::<PhysicsBackend>()
+            .add_systems(
+                FixedUpdate,
+                (
+                    external_forces,
+                    run_spatial_hash,
+                    update_density,
+                    apply_pressure,
+                    apply_viscosity,
+                    update_positions,
+                    resolve_collisions,
+                    compute_particle_colors,
+                )
+                    .chain()
+                    .run_if(in_state(SimulationState::Running))
+                    .run_if(in_state(PhysicsBackend::CPU)),
             )
-                .chain()
-                .run_if(in_state(SimulationState::Running)),
-        );
+            .add_plugins(PhysicsGPUPlugin);
     }
 }
 
@@ -67,13 +70,14 @@ fn run_spatial_hash(settings: Res<FluidSettings>, mut buffer: ResMut<FluidBuffer
         spatial_indices,
         ..
     } = &mut *buffer;
+    let number_of_particles = settings.number_of_particles as usize;
 
-    let mut pairs: Vec<(usize, usize)> = vec![(0, 0); settings.number_of_particles];
+    let mut pairs: Vec<(usize, usize)> = vec![(0, 0); number_of_particles];
 
     pairs.par_iter_mut().enumerate().for_each(|(index, pair)| {
         let cell = get_cell(&predicted_positions[index], settings.smoothing_radius);
         let hash = hash_cell(cell);
-        let key = key_from_hash(hash, settings.number_of_particles);
+        let key = key_from_hash(hash, number_of_particles);
         *pair = (key, index);
     });
 
@@ -84,9 +88,9 @@ fn run_spatial_hash(settings: Res<FluidSettings>, mut buffer: ResMut<FluidBuffer
         spatial_indices[i] = *index;
     }
 
-    spatial_offsets.fill(settings.number_of_particles);
+    spatial_offsets.fill(number_of_particles);
 
-    for i in 0..settings.number_of_particles {
+    for i in 0..number_of_particles {
         let key = spatial_keys[i];
         let prev_key = if i == 0 {
             usize::MAX
@@ -110,6 +114,8 @@ fn update_density(settings: Res<FluidSettings>, mut buffer: ResMut<FluidBuffer>)
         ..
     } = &mut *buffer;
 
+    let number_of_particles = settings.number_of_particles as usize;
+
     densities
         .par_iter_mut()
         .enumerate()
@@ -122,10 +128,10 @@ fn update_density(settings: Res<FluidSettings>, mut buffer: ResMut<FluidBuffer>)
 
             for i in 0..9 {
                 let hash = hash_cell(origin_cell + CELL_OFFSETS[i]);
-                let key = key_from_hash(hash, settings.number_of_particles);
+                let key = key_from_hash(hash, number_of_particles);
                 let mut curr_index = spatial_offsets[key];
 
-                while curr_index < settings.number_of_particles {
+                while curr_index < number_of_particles {
                     let sorted_slot = curr_index;
                     curr_index += 1;
                     let neighbour_key = spatial_keys[sorted_slot];
@@ -169,6 +175,8 @@ fn apply_pressure(
         ..
     } = &mut *buffer;
 
+    let number_of_particles = settings.number_of_particles as usize;
+
     velocities
         .par_iter_mut()
         .enumerate()
@@ -190,10 +198,10 @@ fn apply_pressure(
 
             for i in 0..9 {
                 let hash = hash_cell(origin_cell + CELL_OFFSETS[i]);
-                let key = key_from_hash(hash, settings.number_of_particles);
+                let key = key_from_hash(hash, number_of_particles);
                 let mut curr_index = spatial_offsets[key];
 
-                while curr_index < settings.number_of_particles {
+                while curr_index < number_of_particles {
                     let sorted_slot = curr_index;
                     curr_index += 1;
                     let neighbour_key = spatial_keys[sorted_slot];
@@ -268,6 +276,7 @@ fn apply_viscosity(
     } = &mut *buffer;
 
     let velocities_snapshot = velocities.clone();
+    let number_of_particles = settings.number_of_particles as usize;
 
     velocities
         .par_iter_mut()
@@ -281,10 +290,10 @@ fn apply_viscosity(
 
             for i in 0..9 {
                 let hash = hash_cell(origin_cell + CELL_OFFSETS[i]);
-                let key = key_from_hash(hash, settings.number_of_particles);
+                let key = key_from_hash(hash, number_of_particles);
                 let mut curr_index = spatial_offsets[key];
 
-                while curr_index < settings.number_of_particles {
+                while curr_index < number_of_particles {
                     let sorted_slot = curr_index;
                     curr_index += 1;
 
